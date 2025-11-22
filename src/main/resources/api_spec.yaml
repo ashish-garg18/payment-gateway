@@ -1,0 +1,488 @@
+openapi: 3.0.3
+info:
+  title: Payment Gateway API
+  description: API for Payment Gateway Checkout and Payment Orchestration
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local Development Server
+
+paths:
+  /checkout:
+    post:
+      operationId: getCheckoutOptions
+      summary: Get Checkout Options
+      description: Retrieves all supported payment methods, user's registered instruments, and applies eligibility rules. Idempotent - same idempotency key returns same paymentId.
+      tags:
+        - Checkout
+      parameters:
+        - name: X-User-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-Idempotency-Key
+          in: header
+          required: true
+          description: Unique key for idempotent checkout requests
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+      responses:
+        '200':
+          description: Successful checkout response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutResponse'
+        '400':
+          description: Invalid input parameters
+        '500':
+          description: Internal server error
+
+  /payment/pay:
+    post:
+      operationId: processPayment
+      summary: Initiate Payment
+      description: Validates instrument, selects optimal vendor (Smart Routing), and executes the transaction. Idempotent - retries with same paymentId return existing transaction status.
+      tags:
+        - Payment
+      parameters:
+        - name: X-User-Id
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+      responses:
+        '200':
+          description: Payment processed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '400':
+          description: Invalid payment request
+        '500':
+          description: Internal server error
+
+  /payment/status/{paymentId}:
+    get:
+      operationId: getPaymentStatus
+      summary: Get Payment Status
+      description: Query payment status by paymentId for tracking and retry decisions
+      tags:
+        - Payment
+      parameters:
+        - name: paymentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Payment ID from checkout session
+      responses:
+        '200':
+          description: Payment status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentStatusResponse'
+        '404':
+          description: Payment not found
+        '500':
+          description: Internal server error
+
+  /payments/merchant-onboarding:
+    post:
+      operationId: onboardMerchantConfig
+      summary: Onboard Merchant Payment Configuration
+      description: Internal API for onboarding merchant payment configuration
+      tags:
+        - Merchant Onboarding (Internal)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MerchantConfigRequest'
+      responses:
+        '201':
+          description: Configuration saved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantConfigResponse'
+        '400':
+          description: Invalid request
+        '500':
+          description: Internal server error
+    
+  /payments/merchant-onboarding/{merchantId}:
+    get:
+      operationId: getMerchantConfigs
+      summary: Get All Merchant Configurations
+      description: Retrieve all payment configurations for a merchant
+      tags:
+        - Merchant Onboarding (Internal)
+      parameters:
+        - name: merchantId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: List of merchant configurations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MerchantConfigResponse'
+        '404':
+          description: Merchant not found
+
+  /payments/merchant-onboarding/{merchantId}/{methodId}:
+    get:
+      operationId: getMerchantConfig
+      summary: Get Specific Merchant Configuration
+      description: Retrieve payment configuration for a specific merchant and method
+      tags:
+        - Merchant Onboarding (Internal)
+      parameters:
+        - name: merchantId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: methodId
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "CREDIT_CARD"
+      responses:
+        '200':
+          description: Merchant configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantConfigResponse'
+        '404':
+          description: Configuration not found
+
+components:
+  schemas:
+    # Checkout Request/Response
+    CheckoutRequest:
+      type: object
+      required:
+        - checkoutId
+        - merchant
+        - payment
+      properties:
+        checkoutId:
+          type: string
+          format: uuid
+          description: Unique identifier for this checkout request
+        merchant:
+          $ref: '#/components/schemas/MerchantDetails'
+        payment:
+          $ref: '#/components/schemas/PaymentDetails'
+        paymentId:
+          type: string
+          format: uuid
+          description: Optional. If provided (retry scenario), excludes declined instruments for this payment
+
+    CheckoutResponse:
+      type: object
+      required:
+        - paymentId
+        - paymentMethods
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+          description: Unique identifier for this checkout session
+        paymentMethods:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaymentMethodOption'
+
+    MerchantDetails:
+      type: object
+      required:
+        - merchantId
+      properties:
+        merchantId:
+          type: string
+          format: uuid
+          description: Unique identifier for the merchant
+        mcc:
+          type: string
+          description: Merchant Category Code
+          example: "5411"
+
+    PaymentMethodOption:
+      type: object
+      required:
+        - methodId
+        - methodName
+        - enabled
+      properties:
+        methodId:
+          type: string
+          description: Unique identifier for the payment method
+          example: "CREDIT_CARD"
+        methodName:
+          type: string
+          example: "Credit / Debit Card"
+        supportedNetworks:
+          type: array
+          items:
+            type: string
+          example: ["VISA", "MASTERCARD", "RUPAY"]
+        enabled:
+          type: boolean
+          description: Whether this method is enabled for this checkout
+        reasonIfDisabled:
+          type: string
+          description: Reason if method is disabled
+          example: "Amount exceeds limit"
+        allowAddNew:
+          type: boolean
+          description: If true, client can show "Add New" UI for this method
+        userInstruments:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstrumentDetails'
+
+    InstrumentDetails:
+      type: object
+      required:
+        - instrumentId
+        - methodId
+        - type
+        - eligible
+      properties:
+        instrumentId:
+          type: string
+          format: uuid
+          description: Unique identifier for the instrument
+        methodId:
+          type: string
+          description: Payment method ID this instrument belongs to
+          example: "CREDIT_CARD"
+        maskedDetails:
+          type: string
+          description: Masked card/account number
+          example: "XXXX-XXXX-XXXX-1234"
+        network:
+          type: string
+          description: Card network or payment network
+          example: "VISA"
+        issuer:
+          type: string
+          description: Bank or issuer name
+          example: "HDFC Bank"
+        type:
+          type: string
+          description: Payment method type
+          example: "CREDIT_CARD"
+        eligible:
+          type: boolean
+          description: Whether this instrument is eligible for payment
+        ineligibilityReason:
+          type: string
+          description: Reason if instrument is not eligible
+          example: "Card expired"
+
+    # Payment Request/Response
+    PaymentRequest:
+      type: object
+      required:
+        - paymentId
+        - merchant
+        - payment
+        - instrument
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+          description: Payment ID from checkout session
+        merchant:
+          $ref: '#/components/schemas/MerchantDetails'
+        payment:
+          $ref: '#/components/schemas/PaymentDetails'
+        instrument:
+          $ref: '#/components/schemas/PaymentInstrument'
+
+    PaymentDetails:
+      type: object
+      required:
+        - amount
+      properties:
+        amount:
+          type: number
+          format: double
+          example: 1000.50
+        currency:
+          type: string
+          default: "INR"
+          example: "INR"
+
+    PaymentInstrument:
+      type: object
+      required:
+        - instrumentId
+        - methodId
+      properties:
+        instrumentId:
+          type: string
+          format: uuid
+        methodId:
+          type: string
+          example: "CREDIT_CARD"
+
+    PaymentResponse:
+      type: object
+      required:
+        - paymentId
+        - status
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+          description: Payment ID from the checkout session
+        txnId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [SUCCESS, FAILED, PENDING]
+        failureReason:
+          type: string
+        requiresNewInstrument:
+          type: boolean
+          description: If true, user must select a different instrument (card declined, etc.)
+          default: false
+        retryable:
+          type: boolean
+          description: If true, can retry with same instrument but different vendor
+          default: false
+        responseCode:
+          type: string
+        providerRefId:
+          type: string
+
+    PaymentStatusResponse:
+      type: object
+      required:
+        - paymentId
+        - status
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+          description: Payment ID being queried
+        txnId:
+          type: string
+          format: uuid
+          description: Transaction ID if payment was processed
+        status:
+          type: string
+          enum: [SUCCESS, FAILED, PENDING, NOT_FOUND]
+          description: Current payment status
+        amount:
+          type: number
+          format: double
+          description: Payment amount
+        createdAt:
+          type: string
+          format: date-time
+          description: When payment was initiated
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last status update time
+        failureReason:
+          type: string
+          description: Reason for failure if status is FAILED
+        retryCount:
+          type: integer
+          description: Number of retry attempts made
+          default: 0
+
+    # Merchant Config Request/Response
+    MerchantConfigRequest:
+      type: object
+      required:
+        - merchantId
+        - methodId
+      properties:
+        merchantId:
+          type: string
+          format: uuid
+        methodId:
+          type: string
+          example: "CREDIT_CARD"
+        supportedNetworks:
+          type: array
+          items:
+            type: string
+          example: ["VISA", "MASTERCARD"]
+        minAmount:
+          type: number
+          format: double
+          example: 10.0
+        maxAmount:
+          type: number
+          format: double
+          example: 100000.0
+        enabled:
+          type: boolean
+          default: true
+
+    MerchantConfigResponse:
+      type: object
+      properties:
+        configId:
+          type: string
+          format: uuid
+        merchantId:
+          type: string
+          format: uuid
+        methodId:
+          type: string
+        supportedNetworks:
+          type: array
+          items:
+            type: string
+        minAmount:
+          type: number
+          format: double
+        maxAmount:
+          type: number
+          format: double
+        enabled:
+          type: boolean
+        status:
+          type: string
+        message:
+          type: string

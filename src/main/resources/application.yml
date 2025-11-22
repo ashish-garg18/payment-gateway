@@ -1,0 +1,52 @@
+spring:
+  application:
+    name: payment-gateway
+  datasource:
+    url: jdbc:postgresql://localhost:5432/payment_gateway
+    username: postgres
+    password: password
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+# Actuator and Metrics Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+    metrics:
+      enabled: true
+  metrics:
+    tags:
+      application: payment-gateway
+    enable:
+      jvm: true
+      process: true
+      system: true
+
+# Logging Configuration
+logging:
+  level:
+    com.paymentgateway: INFO
+    org.springframework.web: INFO
+    org.hibernate: WARN
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: payment-group
+      auto-offset-reset: earliest
+
+server:
+  port: 8080

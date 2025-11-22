@@ -1,0 +1,90 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.0'
+    id 'io.spring.dependency-management' version '1.1.4'
+    id 'org.openapi.generator' version '7.1.0'
+}
+
+group = 'com.paymentgateway'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    sourceCompatibility = '17'
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.kafka:spring-kafka'
+    
+    // Metrics and Monitoring
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'io.micrometer:micrometer-core'
+    implementation 'org.springframework.boot:spring-boot-starter-aop'
+    
+    // Database
+    runtimeOnly 'org.postgresql:postgresql'
+    
+    // Rule Engine
+    implementation 'org.jeasy:easy-rules-core:4.1.0'
+    implementation 'org.jeasy:easy-rules-support:4.1.0'
+    
+    // OpenAPI Generated Models
+    implementation 'org.openapitools:jackson-databind-nullable:0.2.6'
+    
+    // Utilities
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+    
+    // Testing
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.kafka:spring-kafka-test'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// OpenAPI Code Generation Configuration
+tasks.register('generateServerApi', org.openapitools.generator.gradle.plugin.tasks.GenerateTask) {
+    generatorName = "spring"
+    inputSpec = "$rootDir/src/main/resources/api_spec.yaml"
+    outputDir = "$buildDir/generated/server"
+    modelPackage = "${project.group}.generated.model"
+    apiPackage = "${project.group}.generated.api"
+    configOptions = [
+        interfaceOnly: "true",
+        useSpringBoot3: "true",
+        useBeanValidation: "true",
+        documentationProvider: "none",
+        exceptionHandler: "false",
+        skipDefaultInterface: "true"
+    ]
+    typeMappings = [
+        DateTime: "java.time.ZonedDateTime"
+    ]
+}
+
+// Hook generation into build
+compileJava.dependsOn tasks.generateServerApi
+
+// Add generated sources to source sets
+sourceSets {
+    main {
+        java {
+            srcDir "${buildDir}/generated/server/src/main/java"
+        }
+    }
+}

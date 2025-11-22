@@ -5,13 +5,15 @@ import com.paymentgateway.generated.model.InstrumentDetails;
 import com.paymentgateway.generated.model.PaymentMethodOption;
 import com.paymentgateway.model.PaymentInstrument;
 import com.paymentgateway.model.PaymentMethod;
+import com.paymentgateway.model.MerchantPaymentConfig;
 import com.paymentgateway.repository.PaymentMethodRepository;
 import io.micrometer.core.annotation.Counted;
 import io.micrometer.core.annotation.Timed;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-
+import org.springframework.data.redis.core.StringRedisTemplate;
+import java.util.concurrent.TimeUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -23,10 +25,12 @@ public class CheckoutService {
 
         private final PaymentMethodRepository paymentMethodRepository;
         private final CustomerInstrumentService customerInstrumentService;
+        private final MerchantConfigService merchantConfigService;
         private final RuleEngineService ruleEngineService;
         private final DowntimeService downtimeService;
+        private final StringRedisTemplate redisTemplate;
 
-        // In-memory cache for idempotency (in production, use Redis/Database)
+        // In-memory cache for idempotency (TODO: Move to Redis)
         private final Map<UUID, CheckoutResponse> idempotencyCache = new ConcurrentHashMap<>();
 
         @Timed(value = "service.execution", extraTags = { "domain", "checkout", "service", "CheckoutService", "method",
@@ -53,14 +57,16 @@ public class CheckoutService {
                         return cachedResponse;
                 }
 
-                // If paymentId provided (retry scenario), fetch declined instruments
-                // TODO: In production, fetch from Redis
+                // If paymentId provided (retry scenario), fetch declined instruments from Redis
                 Set<String> declinedInstruments = new HashSet<>();
                 if (paymentId != null) {
-                        log.debug("Retry scenario detected - paymentId: {}, will exclude declined instruments",
-                                        paymentId);
-                        // declinedInstruments = redisTemplate.opsForSet()
-                        // .members("payment:" + paymentId + ":declined_instruments");
+                        String key = "checkout:declined:" + paymentId;
+                        Set<String> members = redisTemplate.opsForSet().members(key);
+                        if (members != null) {
+                                declinedInstruments.addAll(members);
+                                log.debug("Retry scenario - paymentId: {}, declined instruments: {}", paymentId,
+                                                declinedInstruments);
+                        }
                 }
 
                 // Generate deterministic payment ID from idempotency key
@@ -71,17 +77,18 @@ public class CheckoutService {
                 List<PaymentMethod> globalMethods = paymentMethodRepository.findByActiveTrue();
                 log.debug("Loaded {} global payment methods for checkoutId: {}", globalMethods.size(), checkoutId);
 
-                // 2. Fetch User Instruments and filter out declined ones
-                List<PaymentInstrument> userInstruments = customerInstrumentService.getInstrumentsForUser(userId)
-                                .stream()
-                                .filter(instr -> !declinedInstruments.contains(instr.getInstrumentId().toString()))
-                                .collect(Collectors.toList());
-                log.debug("Found {} user instruments for userId: {}, checkoutId: {} (after filtering)",
+                // 2. Fetch User Instruments
+                List<PaymentInstrument> userInstruments = customerInstrumentService.getInstrumentsForUser(userId);
+                log.debug("Found {} user instruments for userId: {}, checkoutId: {}",
                                 userInstruments.size(), userId, checkoutId);
 
                 List<PaymentMethodOption> methodOptions = new ArrayList<>();
 
                 for (PaymentMethod method : globalMethods) {
+                        // Get Merchant Config for this method
+                        MerchantPaymentConfig merchantConfig = merchantConfigService.getConfig(merchantId,
+                                        method.getMethodId());
+
                         // 3. Apply Rules for the Method itself
                         String methodIneligibilityReason = ruleEngineService.getIneligibilityReason(method, null,
                                         merchantId, mcc, amount);
@@ -150,5 +157,16 @@ public class CheckoutService {
                                 checkoutId, generatedPaymentId, methodOptions.size());
 
                 return response;
+        }
+
+        public void addDeclinedInstrument(UUID paymentId, UUID instrumentId) {
+                if (paymentId == null || instrumentId == null) {
+                        return;
+                }
+                String key = "checkout:declined:" + paymentId;
+                redisTemplate.opsForSet().add(key, instrumentId.toString());
+                redisTemplate.expire(key, 1, TimeUnit.HOURS);
+                log.info("Added declined instrument to Redis - paymentId: {}, instrumentId: {}", paymentId,
+                                instrumentId);
         }
 }

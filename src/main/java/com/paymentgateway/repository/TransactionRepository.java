@@ -7,4 +7,5 @@ import java.util.UUID;
 
 @Repository
 public interface TransactionRepository extends JpaRepository<Transaction, UUID> {
+    java.util.Optional<Transaction> findByPaymentId(UUID paymentId);
 }

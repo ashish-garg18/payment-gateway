@@ -156,6 +156,7 @@ Last Updated: 2025-11-22
 - [x] Checkout filtering of declined instruments (in-memory, Redis TODO)
 - [x] Payment status query endpoint
 - [x] Retry count tracking
+- [x] Code pushed to GitHub (https://github.com/ashish-garg18/payment-gateway.git)
 - [ ] Redis integration for production state management
 
 ---
@@ -166,9 +167,24 @@ Last Updated: 2025-11-22
 - [x] Fix test failures (endpoint path mismatches)
 - [x] Update tests for new optional paymentId parameter
 - [x] Add tests for payment status endpoint
-- [ ] Integration tests with H2 database
-- [ ] End-to-end API tests
+- [x] Integration tests with H2 database (Created PaymentGatewayIntegrationTest)
+- [ ] End-to-end API tests (Manual verification pending)
 - [ ] Performance tests
+
+### 3. Redis Integration (Completed 2025-11-22)
+- [x] Add Redis dependency to `build.gradle`
+- [x] Configure Redis in `application.yml`
+- [x] Create `docker-compose.yml` for Redis and Postgres
+- [x] Implement Redis-based retry count in `PaymentService`
+- [x] Implement Redis-based declined instruments in `CheckoutService`
+- [x] Implement Redis-based payment status caching in `PaymentService`
+- [x] Verify with unit tests
+
+### 4. Database Schema Updates (Completed 2025-11-22)
+- [x] Add `paymentId` column to `Transaction` entity
+- [x] Add index on `paymentId`
+- [x] Add `findByPaymentId` to `TransactionRepository`
+- [x] Update `PaymentService` to populate `paymentId`
 
 ---
 

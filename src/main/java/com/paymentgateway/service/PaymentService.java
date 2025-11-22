@@ -6,12 +6,15 @@ import com.paymentgateway.generated.model.PaymentStatusResponse;
 import com.paymentgateway.model.Transaction;
 import com.paymentgateway.model.VendorHealth;
 import com.paymentgateway.repository.TransactionRepository;
+import com.paymentgateway.service.impl.VendorExecutionResult;
 import io.micrometer.core.annotation.Counted;
 import io.micrometer.core.annotation.Timed;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-
+import org.springframework.data.redis.core.StringRedisTemplate;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.concurrent.TimeUnit;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.OffsetDateTime;
@@ -27,6 +30,11 @@ public class PaymentService {
         private final VendorAvailabilityService vendorAvailabilityService;
         private final PricingService pricingService;
         private final TransactionRepository transactionRepository;
+        private final MerchantConfigService merchantConfigService;
+        private final CheckoutService checkoutService;
+        private final StringRedisTemplate redisTemplate;
+        private final ObjectMapper objectMapper;
+        private final VendorExecutionService vendorExecutionService;
 
         // In-memory cache for payment idempotency (in production, use Redis/Database)
         // Maps paymentId -> Transaction
@@ -50,7 +58,9 @@ public class PaymentService {
                                 userId, request.getMerchant().getMerchantId(), paymentId);
 
                 // Increment retry count
-                retryCount.merge(paymentId, 1, Integer::sum);
+                String retryKey = "payment:retry:" + paymentId;
+                redisTemplate.opsForValue().increment(retryKey);
+                redisTemplate.expire(retryKey, 24, TimeUnit.HOURS);
 
                 // IDEMPOTENCY: Check if payment already processed for this paymentId
                 if (paymentCache.containsKey(paymentId)) {
@@ -103,7 +113,7 @@ public class PaymentService {
                         Transaction failedTxn = createFailedTransaction(
                                         paymentId, userId, request,
                                         "No payment vendors available (all vendors exhausted)",
-                                        FailureType.VENDOR_ERROR);
+                                        VendorExecutionResult.FailureType.VENDOR_ERROR);
                         paymentCache.put(paymentId, failedTxn);
                         return buildResponse(paymentId, failedTxn);
                 }
@@ -124,44 +134,45 @@ public class PaymentService {
                 txn.setTxnId(UUID.randomUUID());
                 txn.setUserId(userId);
                 txn.setMerchantId(request.getMerchant().getMerchantId());
+                txn.setPaymentId(paymentId);
                 txn.setInstrumentId(request.getInstrument().getInstrumentId());
                 txn.setMethodId(request.getInstrument().getMethodId());
                 txn.setAmount(request.getPayment().getAmount());
                 txn.setVendorId(selectedVendor.getVendorId());
                 txn.setStatus("INITIATED");
+                txn.setCreatedAt(LocalDateTime.now());
 
                 transactionRepository.save(txn);
 
                 // Execute Payment (with vendor call)
-                VendorExecutionResult result = executeVendorPayment(selectedVendor.getVendorId(), request);
+                VendorExecutionResult result = vendorExecutionService.executeVendorPayment(selectedVendor.getVendorId(),
+                                request);
 
                 // Update Status based on vendor response
                 if (result.isSuccess()) {
                         txn.setStatus("SUCCESS");
-                        log.info("Payment successful - paymentId: {}, txnId: {}, vendor: {}",
-                                        paymentId, txn.getTxnId(), selectedVendor.getVendorId());
+                        txn.setUpdatedAt(LocalDateTime.now());
+                        transactionRepository.save(txn);
+                        paymentCache.put(paymentId, txn);
+                        savePaymentStatus(paymentId, txn, 0);
+                        return buildResponse(paymentId, txn);
                 } else {
                         txn.setStatus("FAILED");
                         txn.setFailureReason(result.getFailureReason());
+                        txn.setUpdatedAt(LocalDateTime.now());
+                        transactionRepository.save(txn);
+                        paymentCache.put(paymentId, txn);
 
-                        // Track failed vendor for this payment if vendor error
-                        if (result.getFailureType() == FailureType.VENDOR_ERROR ||
-                                        result.getFailureType() == FailureType.TIMEOUT) {
-                                failedVendors.computeIfAbsent(paymentId, k -> new HashSet<>())
-                                                .add(selectedVendor.getVendorId());
-                        }
+                        // Track failed vendor
+                        failedVendors.computeIfAbsent(paymentId, k -> new HashSet<>())
+                                        .add(selectedVendor.getVendorId());
 
-                        log.warn("Payment failed - paymentId: {}, txnId: {}, vendor: {}, type: {}, reason: {}",
-                                        paymentId, txn.getTxnId(), selectedVendor.getVendorId(),
-                                        result.getFailureType(), result.getFailureReason());
+                        // Track retry count
+                        int retries = retryCount.getOrDefault(paymentId, 0);
+                        savePaymentStatus(paymentId, txn, retries);
+
+                        return buildResponse(paymentId, txn, result.getFailureType());
                 }
-
-                transactionRepository.save(txn);
-
-                // Cache the transaction for idempotency
-                paymentCache.put(paymentId, txn);
-
-                return buildResponse(paymentId, txn, result.getFailureType());
         }
 
         @Timed(value = "service.execution", extraTags = { "domain", "payment", "service", "PaymentService", "method",
@@ -171,14 +182,22 @@ public class PaymentService {
         public PaymentStatusResponse getPaymentStatus(UUID paymentId) {
                 log.info("Querying payment status - paymentId: {}", paymentId);
 
-                // Check cache first
+                // Check Redis first
+                try {
+                        String key = "payment:status:" + paymentId;
+                        String statusJson = redisTemplate.opsForValue().get(key);
+                        if (statusJson != null) {
+                                return objectMapper.readValue(statusJson, PaymentStatusResponse.class);
+                        }
+                } catch (Exception e) {
+                        log.error("Failed to deserialize payment status", e);
+                }
+
+                // Check in-memory cache (fallback)
                 if (paymentCache.containsKey(paymentId)) {
                         Transaction txn = paymentCache.get(paymentId);
                         return buildStatusResponse(paymentId, txn);
                 }
-
-                // TODO: Query from database by paymentId when column is added
-                // Optional<Transaction> txn = transactionRepository.findByPaymentId(paymentId);
 
                 log.warn("Payment not found - paymentId: {}", paymentId);
                 PaymentStatusResponse response = new PaymentStatusResponse();
@@ -186,6 +205,19 @@ public class PaymentService {
                 response.setStatus(PaymentStatusResponse.StatusEnum.NOT_FOUND);
                 response.setRetryCount(0);
                 return response;
+        }
+
+        private void savePaymentStatus(UUID paymentId, Transaction txn, int retryCount) {
+                try {
+                        PaymentStatusResponse response = buildStatusResponse(paymentId, txn);
+                        response.setRetryCount(retryCount);
+
+                        String statusJson = objectMapper.writeValueAsString(response);
+                        String key = "payment:status:" + paymentId;
+                        redisTemplate.opsForValue().set(key, statusJson, 24, TimeUnit.HOURS);
+                } catch (Exception e) {
+                        log.error("Failed to save payment status to Redis", e);
+                }
         }
 
         private boolean isRetryableFailure(String failureReason) {
@@ -202,17 +234,19 @@ public class PaymentService {
 
         private Transaction createFailedTransaction(
                         UUID paymentId, UUID userId, PaymentRequest request,
-                        String failureReason, FailureType failureType) {
+                        String failureReason, VendorExecutionResult.FailureType failureType) {
 
                 Transaction txn = new Transaction();
                 txn.setTxnId(UUID.randomUUID());
                 txn.setUserId(userId);
                 txn.setMerchantId(request.getMerchant().getMerchantId());
+                txn.setPaymentId(paymentId);
                 txn.setInstrumentId(request.getInstrument().getInstrumentId());
                 txn.setMethodId(request.getInstrument().getMethodId());
                 txn.setAmount(request.getPayment().getAmount());
                 txn.setStatus("FAILED");
                 txn.setFailureReason(failureReason);
+                txn.setCreatedAt(LocalDateTime.now());
 
                 transactionRepository.save(txn);
                 return txn;
@@ -222,7 +256,8 @@ public class PaymentService {
                 return buildResponse(paymentId, txn, null);
         }
 
-        private PaymentResponse buildResponse(UUID paymentId, Transaction txn, FailureType failureType) {
+        private PaymentResponse buildResponse(UUID paymentId, Transaction txn,
+                        VendorExecutionResult.FailureType failureType) {
                 PaymentResponse response = new PaymentResponse();
                 response.setPaymentId(paymentId);
                 response.setTxnId(txn.getTxnId());
@@ -231,15 +266,42 @@ public class PaymentService {
 
                 // Set retry flags based on failure type
                 if ("FAILED".equals(txn.getStatus()) && failureType != null) {
-                        response.setRetryable(failureType == FailureType.VENDOR_ERROR ||
-                                        failureType == FailureType.TIMEOUT);
-                        response.setRequiresNewInstrument(failureType == FailureType.INSTRUMENT_DECLINE);
+                        response.setRetryable(failureType == VendorExecutionResult.FailureType.VENDOR_ERROR ||
+                                        failureType == VendorExecutionResult.FailureType.TIMEOUT);
+                        response.setRequiresNewInstrument(
+                                        failureType == VendorExecutionResult.FailureType.INSTRUMENT_DECLINE);
                 } else {
                         response.setRetryable(false);
                         response.setRequiresNewInstrument(false);
                 }
 
+                // Set response code
+                if (failureType != null) {
+                        response.setResponseCode(getResponseCode(failureType));
+                } else if ("SUCCESS".equals(txn.getStatus())) {
+                        response.setResponseCode("00");
+                } else {
+                        response.setResponseCode("99");
+                }
+
                 return response;
+        }
+
+        private String getResponseCode(VendorExecutionResult.FailureType failureType) {
+                if (failureType == null)
+                        return "99";
+                switch (failureType) {
+                        case VENDOR_ERROR:
+                                return "50";
+                        case INSTRUMENT_DECLINE:
+                                return "51";
+                        case VALIDATION_ERROR:
+                                return "40";
+                        case TIMEOUT:
+                                return "54";
+                        default:
+                                return "99";
+                }
         }
 
         private PaymentStatusResponse buildStatusResponse(UUID paymentId, Transaction txn) {
@@ -259,76 +321,5 @@ public class PaymentService {
                         response.setUpdatedAt(txn.getUpdatedAt().atZone(ZoneId.systemDefault()));
                 }
                 return response;
-        }
-
-        private VendorExecutionResult executeVendorPayment(String vendorId, PaymentRequest request) {
-                // Mock execution - in real life, this calls PayU/Razorpay API
-                // Simulate different vendor behaviors
-
-                double random = Math.random();
-
-                // Simulate 5% vendor failure rate
-                if (random < 0.05) {
-                        return VendorExecutionResult.failure(
-                                        "Vendor processing failed - temporary issue",
-                                        FailureType.VENDOR_ERROR);
-                }
-
-                // Simulate 3% instrument decline rate
-                if (random < 0.08) {
-                        return VendorExecutionResult.failure(
-                                        "Card declined - Insufficient funds",
-                                        FailureType.INSTRUMENT_DECLINE);
-                }
-
-                // Simulate 2% timeout
-                if (random < 0.10) {
-                        return VendorExecutionResult.failure(
-                                        "Vendor timeout - network error",
-                                        FailureType.TIMEOUT);
-                }
-
-                return VendorExecutionResult.success();
-        }
-
-        // Failure type enum
-        private enum FailureType {
-                VENDOR_ERROR, // Retryable with different vendor
-                INSTRUMENT_DECLINE, // Requires new instrument
-                VALIDATION_ERROR, // Non-retryable
-                TIMEOUT // Retryable with same or different vendor
-        }
-
-        // Inner class for vendor execution result
-        private static class VendorExecutionResult {
-                private final boolean success;
-                private final String failureReason;
-                private final FailureType failureType;
-
-                private VendorExecutionResult(boolean success, String failureReason, FailureType failureType) {
-                        this.success = success;
-                        this.failureReason = failureReason;
-                        this.failureType = failureType;
-                }
-
-                public static VendorExecutionResult success() {
-                        return new VendorExecutionResult(true, null, null);
-                }
-
-                public static VendorExecutionResult failure(String reason, FailureType type) {
-                        return new VendorExecutionResult(false, reason, type);
-                }
-
-                public boolean isSuccess() {
-                        return success;
-                }
-
-                public String getFailureReason() {
-                        return failureReason;
-                }
-
-                public FailureType getFailureType() {
-                        return failureType;
-                }
         }
 }

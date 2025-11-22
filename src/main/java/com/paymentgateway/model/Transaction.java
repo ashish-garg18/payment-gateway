@@ -6,7 +6,9 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "transactions")
+@Table(name = "transactions", indexes = {
+    @Index(name = "idx_transaction_payment_id", columnList = "payment_id")
+})
 @Data
 public class Transaction {
 
@@ -19,6 +21,9 @@ public class Transaction {
 
     @Column(name = "merchant_id", nullable = false)
     private UUID merchantId;
+
+    @Column(name = "payment_id", nullable = false)
+    private UUID paymentId;
 
     @Column(name = "instrument_id")
     private UUID instrumentId;
